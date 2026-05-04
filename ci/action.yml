@@ -1,0 +1,121 @@
+name: Python CI
+description: Runs linting, type checks, tests, and coverage with uv for a Python package.
+
+inputs:
+  python-version:
+    description: Python version to use for the checks.
+    required: false
+    default: "3.11"
+  package-source-folder:
+    description: Package folder to lint/test coverage for (for example, src/gallagher_restapi).
+    required: true
+  run-ruff:
+    description: Whether to run Ruff.
+    required: false
+    default: "true"
+  run-mypy:
+    description: Whether to run MyPy.
+    required: false
+    default: "true"
+  run-pylint:
+    description: Whether to run Pylint.
+    required: false
+    default: "true"
+  run-pytest:
+    description: Whether to run Pytest with coverage.
+    required: false
+    default: "true"
+  diff-coverage-threshold:
+    description: Minimum PR changed-lines coverage percentage enforced by diff-cover.
+    required: false
+    default: "95"
+
+outputs:
+  coverage-report:
+    description: Path to the generated coverage XML report.
+    value: ${{ steps.coverage.outputs.coverage-report }}
+  total-coverage:
+    description: Total line coverage percentage from coverage.xml.
+    value: ${{ steps.coverage.outputs.total-coverage }}
+  diff-coverage:
+    description: Changed-lines coverage percentage from diff-cover on pull requests.
+    value: ${{ steps.diff_cover.outputs.diff-coverage }}
+
+runs:
+  using: composite
+  steps:
+    - name: Checkout
+      uses: actions/checkout@v6.0.2
+      with:
+        fetch-depth: 0
+
+    - name: Setup Python
+      uses: actions/setup-python@v6.2.0
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Setup uv
+      uses: astral-sh/setup-uv@v8.1.0
+      with:
+        enable-cache: true
+
+    - name: Install dependencies
+      shell: bash
+      run: uv sync --group dev
+
+    - name: Ruff
+      if: ${{ inputs.run-ruff == 'true' }}
+      shell: bash
+      run: uv run ruff check .
+
+    - name: MyPy
+      if: ${{ inputs.run-mypy == 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        SOURCE_ROOT="$(dirname "${{ inputs.package-source-folder }}")"
+        if [ -d tests ]; then
+          uv run mypy "$SOURCE_ROOT" tests
+        else
+          uv run mypy "$SOURCE_ROOT"
+        fi
+
+    - name: Pylint
+      if: ${{ inputs.run-pylint == 'true' }}
+      shell: bash
+      run: uv run pylint "${{ inputs.package-source-folder }}"
+
+    - name: Pytest + coverage
+      if: ${{ inputs.run-pytest == 'true' }}
+      id: coverage
+      shell: bash
+      run: |
+        set -euo pipefail
+        uv run pytest -q --cov="${{ inputs.package-source-folder }}" --cov-report=xml --cov-report=term-missing
+        TOTAL_COVERAGE=$(python -c "import xml.etree.ElementTree as ET; root=ET.parse('coverage.xml').getroot(); print(f'{float(root.attrib.get(\"line-rate\", \"0\"))*100:.2f}')")
+        echo "coverage-report=coverage.xml" >> "$GITHUB_OUTPUT"
+        echo "total-coverage=$TOTAL_COVERAGE" >> "$GITHUB_OUTPUT"
+        echo "## Coverage Summary" >> "$GITHUB_STEP_SUMMARY"
+        echo "Total coverage: ${TOTAL_COVERAGE}%" >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Ensure base branch is available (PR only)
+      if: github.event_name == 'pull_request'
+      shell: bash
+      run: git fetch origin "${{ github.base_ref }}"
+
+    - name: Diff coverage (PR only)
+      if: ${{ github.event_name == 'pull_request' && inputs.run-pytest == 'true' }}
+      id: diff_cover
+      shell: bash
+      run: |
+        set +e
+        DIFF_OUTPUT=$(uvx --from diff-cover diff-cover coverage.xml \
+          --compare-branch=origin/${{ github.base_ref }} \
+          --fail-under=${{ inputs.diff-coverage-threshold }} \
+          --format markdown:diff-cover.md)
+        EXIT_CODE=$?
+        echo "$DIFF_OUTPUT"
+        DIFF_COVERAGE=$(echo "$DIFF_OUTPUT" | sed -nE 's/^Total:[[:space:]]*([0-9]+([.][0-9]+)?)%.*/\1/p' | tail -n1)
+        echo "diff-coverage=$DIFF_COVERAGE" >> "$GITHUB_OUTPUT"
+        cat diff-cover.md >> "$GITHUB_STEP_SUMMARY"
+        exit $EXIT_CODE

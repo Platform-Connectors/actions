@@ -35,7 +35,7 @@ jobs:
     steps:
       - uses: platform-connectors/actions/publish-library@v1
         with:
-          python-version: "3.12"
+          python-version: "<python-version>"
 ```
 
 ## Outputs

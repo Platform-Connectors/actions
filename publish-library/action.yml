@@ -1,0 +1,62 @@
+name: Publish Library to PyPI
+description: >
+  Verifies the release tag matches the project version in pyproject.toml,
+  builds sdist & wheel with uv, and publishes to PyPI using OIDC trusted publishing.
+
+inputs:
+  python-version:
+    description: Python version to use with uv.
+    required: false
+    default: "3.11"
+
+outputs:
+  version:
+    description: The project version that was published.
+    value: ${{ steps.verify.outputs.version }}
+
+runs:
+  using: composite
+  steps:
+    - name: Checkout
+      uses: actions/checkout@v6
+
+    - name: Set up uv (Python ${{ inputs.python-version }})
+      uses: astral-sh/setup-uv@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Verify tag matches version
+      id: verify
+      shell: bash
+      run: |
+        TAG_NAME="${GITHUB_REF_NAME}"
+        TAG_STRIPPED=${TAG_NAME#v}
+        VERSION=$(uv version --short)
+        if [ -z "$VERSION" ]; then
+          echo '::error::Unable to determine version from pyproject.toml'
+          exit 1
+        fi
+        echo "Version in pyproject.toml: $VERSION"
+        if [ "$TAG_STRIPPED" != "$VERSION" ]; then
+          echo "::error::Tag ($TAG_NAME) does not match project version ($VERSION)."
+          exit 1
+        fi
+        echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+    - name: Build distributions (sdist & wheel) with uv
+      shell: bash
+      run: |
+        uv build
+        ls -l dist
+
+    - name: Publish to PyPI with uv (trusted publisher)
+      if: startsWith(github.ref, 'refs/tags/')
+      shell: bash
+      run: |
+        uv publish dist/*
+
+    - name: Summary
+      if: success()
+      shell: bash
+      run: |
+        echo "Published version ${{ steps.verify.outputs.version }} to PyPI." >> $GITHUB_STEP_SUMMARY

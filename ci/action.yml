@@ -103,19 +103,51 @@ runs:
       shell: bash
       run: git fetch origin "${{ github.base_ref }}"
 
-    - name: Diff coverage (PR only)
-      if: ${{ github.event_name == 'pull_request' && inputs.run-pytest == 'true' }}
-      id: diff_cover
+    - name: Evaluate Total and Diff Coverage
+      id: coverage_eval
       shell: bash
       run: |
-        set +e
-        DIFF_OUTPUT=$(uvx --from diff-cover diff-cover coverage.xml \
-          --compare-branch=origin/${{ github.base_ref }} \
-          --fail-under=${{ inputs.diff-coverage-threshold }} \
-          --format markdown:diff-cover.md)
-        EXIT_CODE=$?
-        echo "$DIFF_OUTPUT"
-        DIFF_COVERAGE=$(echo "$DIFF_OUTPUT" | sed -nE 's/^Total:[[:space:]]*([0-9]+([.][0-9]+)?)%.*/\1/p' | tail -n1)
-        echo "diff-coverage=$DIFF_COVERAGE" >> "$GITHUB_OUTPUT"
-        cat diff-cover.md >> "$GITHUB_STEP_SUMMARY"
-        exit $EXIT_CODE
+        echo "=== Checking Total Code Coverage ==="
+        # 1. Output the report to logs
+        uv run coverage report
+
+        # 2. Extract total coverage percentage for the output variable
+        # Matches the 'TOTAL ... 93%' string from the coverage tool
+        TOTAL_LOG=$(uv run coverage report | tail -n1)
+        TOTAL_COVERAGE=$(echo "$TOTAL_LOG" | sed -nE 's/.*[[:space:]]+([0-9]+)%.*/\1/p')
+        echo "total-coverage=$TOTAL_COVERAGE" >> "$GITHUB_OUTPUT"
+
+        # 3. Set standard report path output
+        echo "coverage-report=coverage.xml" >> "$GITHUB_OUTPUT"
+
+        # 4. Enforce total baseline constraint
+        uv run coverage report --fail-under=${{ inputs.total-coverage-threshold || '95' }}
+
+        # 5. Handle PR diff coverage if applicable
+        if [ "${{ github.event_name }}" = "pull_request" ]; then
+          echo "=== Checking PR Diff Coverage ==="
+          
+          uvx --from diff-cover diff-cover coverage.xml \
+            --compare-branch=origin/${{ github.base_ref }} \
+            --fail-under=${{ inputs.diff-coverage-threshold || '95' }} \
+            --format markdown:diff-cover.md > diff_output.log 2>&1
+            
+          EXIT_CODE=$?
+          cat diff_output.log
+          
+          # Extract diff coverage percentage for the output variable
+          DIFF_COVERAGE=$(sed -nE 's/^Total:[[:space:]]*([0-9]+([.][0-9]+)?)%.*/\1/p' diff_output.log | tail -n1)
+          if [ -z "$DIFF_COVERAGE" ]; then
+            DIFF_COVERAGE="0"
+          fi
+          echo "diff-coverage=$DIFF_COVERAGE" >> "$GITHUB_OUTPUT"
+          
+          if [ -f diff-cover.md ]; then
+            cat diff-cover.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+          
+          exit $EXIT_CODE
+        else
+          # Fallback value if it's a push to main (where no diff context exists)
+          echo "diff-coverage=100" >> "$GITHUB_OUTPUT"
+        fi

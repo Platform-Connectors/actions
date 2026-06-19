@@ -25,10 +25,14 @@ inputs:
     description: Whether to run Pytest with coverage.
     required: false
     default: "true"
-  diff-coverage-threshold:
-    description: Minimum PR changed-lines coverage percentage enforced by diff-cover.
+  total-coverage-threshold:
+    description: "Minimum overall codebase coverage percentage enforced."
     required: false
     default: "95"
+  diff-coverage-threshold:
+    description: "Minimum PR changed-lines coverage percentage enforced by diff-cover."
+    required: false
+    default: "100"
 
 outputs:
   coverage-report:
@@ -107,47 +111,52 @@ runs:
       id: coverage_eval
       shell: bash
       run: |
-        echo "=== Checking Total Code Coverage ==="
-        # 1. Output the report to logs
-        uv run coverage report
+        # Initialize an overall failure tracker flag
+        STEP_FAILED=0
 
-        # 2. Extract total coverage percentage for the output variable
-        # Matches the 'TOTAL ... 93%' string from the coverage tool
+        echo "=== Checking Total Code Coverage ==="
+        # 1. Extract total coverage value for outputs safely
         TOTAL_LOG=$(uv run coverage report | tail -n1)
         TOTAL_COVERAGE=$(echo "$TOTAL_LOG" | sed -nE 's/.*[[:space:]]+([0-9]+)%.*/\1/p')
         echo "total-coverage=$TOTAL_COVERAGE" >> "$GITHUB_OUTPUT"
-
-        # 3. Set standard report path output
         echo "coverage-report=coverage.xml" >> "$GITHUB_OUTPUT"
 
-        # 4. Enforce total baseline constraint
-        uv run coverage report --fail-under=${{ inputs.total-coverage-threshold || '95' }}
+        # 2. Check total baseline constraint but catch its exit status instead of crashing
+        uv run coverage report --fail-under=${{ inputs.total-coverage-threshold }}
+        TOTAL_EXIT_CODE=$?
+        if [ $TOTAL_EXIT_CODE -ne 0 ]; then
+          STEP_FAILED=1
+        fi
 
-        # 5. Handle PR diff coverage if applicable
+        # 3. Process PR diff coverage if applicable
         if [ "${{ github.event_name }}" = "pull_request" ]; then
           echo "=== Checking PR Diff Coverage ==="
           
           uvx --from diff-cover diff-cover coverage.xml \
             --compare-branch=origin/${{ github.base_ref }} \
-            --fail-under=${{ inputs.diff-coverage-threshold || '95' }} \
+            --fail-under=${{ inputs.diff-coverage-threshold }} \
             --format markdown:diff-cover.md > diff_output.log 2>&1
             
-          EXIT_CODE=$?
+          DIFF_EXIT_CODE=$?
           cat diff_output.log
           
           # Extract diff coverage percentage for the output variable
           DIFF_COVERAGE=$(sed -nE 's/^Total:[[:space:]]*([0-9]+([.][0-9]+)?)%.*/\1/p' diff_output.log | tail -n1)
-          if [ -z "$DIFF_COVERAGE" ]; then
-            DIFF_COVERAGE="0"
-          fi
-          echo "diff-coverage=$DIFF_COVERAGE" >> "$GITHUB_OUTPUT"
+          echo "diff-coverage=${DIFF_COVERAGE:-0}" >> "$GITHUB_OUTPUT"
           
           if [ -f diff-cover.md ]; then
             cat diff-cover.md >> "$GITHUB_STEP_SUMMARY"
           fi
           
-          exit $EXIT_CODE
+          if [ $DIFF_EXIT_CODE -ne 0 ]; then
+            STEP_FAILED=1
+          fi
         else
-          # Fallback value if it's a push to main (where no diff context exists)
           echo "diff-coverage=100" >> "$GITHUB_OUTPUT"
+        fi
+
+        # 4. Finally, break the pipeline step if either threshold was breached
+        if [ $STEP_FAILED -ne 0 ]; then
+          echo "❌ Critical: Code coverage limits were breached."
+          exit 2
         fi

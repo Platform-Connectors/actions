@@ -111,64 +111,103 @@ runs:
       id: diff_coverage
       shell: bash
       run: |
-        # 1. Run diff-cover (Remove the heavy stdout redirection so we can grab the percentage)
+        # 1. Run diff-cover
         uvx --from diff-cover diff-cover coverage.xml \
           --compare-branch=origin/${{ github.base_ref }} \
           --fail-under=${{ inputs.diff-coverage-threshold }} \
           --format markdown:diff-cover.md > terminal_output.log 2>&1
 
-        # Save the exit code to determine success/failure later
         EXIT_CODE=$?
 
-        # 2. Extract the overall percentage from the terminal output
-        # diff-cover outputs a line like: "Total: 12 lines, 10 covered (83%)" or similar.
-        # Let's grab the percentage line cleanly:
-        PERCENTAGE=$(grep -i "Coverage:" terminal_output.log | grep -oE "[0-9]+%" | head -1 || echo "0%")
-        if [ -z "$PERCENTAGE" ]; then
-          PERCENTAGE=$(grep -oE "[0-9]+(\.[0-9]+)?%" terminal_output.log | tail -1 || echo "0%")
+        # 2. Check if there are actually any lines/files to compare in the diff
+        if grep -qE "No lines with coverage|No Python files found" terminal_output.log; then
+          HAS_CHANGES="false"
+          DIFF_PERCENTAGE="0%"
+          EXIT_CODE=0
+        else
+          HAS_CHANGES="true"
+          DIFF_PERCENTAGE=$(grep -i "Coverage:" terminal_output.log | grep -oE "[0-9]+%" | head -1 || echo "0%")
+          if [ -z "$DIFF_PERCENTAGE" ]; then
+            DIFF_PERCENTAGE=$(grep -oE "[0-9]+(\.[0-9]+)?%" terminal_output.log | tail -1 || echo "0%")
+          fi
         fi
 
-        echo "percentage=$PERCENTAGE" >> $GITHUB_OUTPUT
-        echo "exit_code=$EXIT_CODE" >> $GITHUB_OUTPUT
+        # 3. Extract the TOTAL repository coverage from the log
+        TOTAL_PERCENTAGE=$(grep -i "TOTAL" terminal_output.log | grep -oE "[0-9]+%" | head -1 || echo "0%")
+        TOTAL_NUM=$(echo "$TOTAL_PERCENTAGE" | sed 's/%//')
+        TARGET_TOTAL="${{ inputs.total-coverage-threshold }}"
 
-        # 3. Push the markdown report directly to the GitHub Actions Summary page
-        if [ -f diff-cover.md ]; then
+        # Determine total coverage state
+        if [ "$TOTAL_NUM" -ge "$TARGET_TOTAL" ]; then
+          TOTAL_STATUS="success"
+        else
+          TOTAL_STATUS="failure"
+        fi
+
+        # Export outputs
+        echo "has_changes=$HAS_CHANGES" >> $GITHUB_OUTPUT
+        echo "diff_percentage=$DIFF_PERCENTAGE" >> $GITHUB_OUTPUT
+        echo "diff_exit_code=$EXIT_CODE" >> $GITHUB_OUTPUT
+        echo "total_percentage=$TOTAL_PERCENTAGE" >> $GITHUB_OUTPUT
+        echo "total_status=$TOTAL_STATUS" >> $GITHUB_OUTPUT
+
+        # 4. Push markdown summary page for deep diving logs
+        if [ "$HAS_CHANGES" = "true" ] && [ -f diff-cover.md ]; then
           cat diff-cover.md >> $GITHUB_STEP_SUMMARY
         else
-          echo "### ❌ Diff Cover failed to generate a report" >> $GITHUB_STEP_SUMMARY
-          cat terminal_output.log >> $GITHUB_STEP_SUMMARY
+          echo "### ℹ️ Coverage Summary" >> $GITHUB_STEP_SUMMARY
+          echo "**Total Project Coverage:** $TOTAL_PERCENTAGE (Target: ${TARGET_TOTAL}%)" >> $GITHUB_STEP_SUMMARY
         fi
 
-    # 4. Post the custom status check directly to the PR merge box
-    - name: Post Status Check to PR
+    - name: Post Status Check to PR (Only on Failures)
       if: always()
       env:
         GH_TOKEN: ${{ github.token }}
-        PERCENTAGE: ${{ steps.diff_coverage.outputs.percentage }}
-        EXIT_CODE: ${{ steps.diff_coverage.outputs.exit_code }}
-        TARGET: ${{ inputs.diff-coverage-threshold }}
+        HAS_CHANGES: ${{ steps.diff_coverage.outputs.has_changes }}
+        DIFF_PERCENTAGE: ${{ steps.diff_coverage.outputs.diff_percentage }}
+        DIFF_EXIT_CODE: ${{ steps.diff_coverage.outputs.diff_exit_code }}
+        DIFF_TARGET: ${{ inputs.diff-coverage-threshold }}
+        TOTAL_PERCENTAGE: ${{ steps.diff_coverage.outputs.total_percentage }}
+        TOTAL_STATUS: ${{ steps.diff_coverage.outputs.total_status }}
+        TOTAL_TARGET: ${{ inputs.total-coverage-threshold }}
+        TARGET_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
       shell: bash
       run: |
-        # Determine state and description
-        if [ "$EXIT_CODE" -eq 0 ]; then
-          STATE="success"
-          DESC="$PERCENTAGE of diff hit (target $TARGET%)"
-        else
-          STATE="failure"
-          DESC="$PERCENTAGE of diff hit (target $TARGET%)"
+        SHOULD_FAIL_JOB=false
+
+        # --- POST TOTAL PROJECT COVERAGE ONLY IF FAILED ---
+        if [ "$TOTAL_STATUS" = "failure" ]; then
+          TOTAL_DESC="TOTAL coverage fell short: $TOTAL_PERCENTAGE (Target ${TOTAL_TARGET}%)"
+          
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            /repos/${{ github.repository }}/statuses/${{ github.event.pull_request.head.sha }} \
+            -f state="failure" \
+            -f context="diff-cover/project" \
+            -f description="$TOTAL_DESC" \
+            -f target_url="$TARGET_URL"
+            
+          SHOULD_FAIL_JOB=true
         fi
 
-        # Call GitHub API to create the exact status line
-        gh api \
-          --method POST \
-          -H "Accept: application/vnd.github+json" \
-          /repos/${{ github.repository }}/statuses/${{ github.event.pull_request.head.sha }} \
-          -f state="$STATE" \
-          -f context="diff-cover/patch" \
-          -f description="$DESC" \
-          -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        # --- POST PATCH/DIFF COVERAGE ONLY IF FAILED ---
+        if [ "$HAS_CHANGES" = "true" ] && [ "$DIFF_EXIT_CODE" -ne 0 ]; then
+          DIFF_DESC="PATCH coverage fell short: $DIFF_PERCENTAGE (Target ${DIFF_TARGET}%)"
+          
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            /repos/${{ github.repository }}/statuses/${{ github.event.pull_request.head.sha }} \
+            -f state="failure" \
+            -f context="diff-cover/patch" \
+            -f description="$DIFF_DESC" \
+            -f target_url="$TARGET_URL"
 
-        # Finally, force the workflow runner to actually fail if diff-cover failed
-        if [ "$EXIT_CODE" -ne 0 ]; then
+          SHOULD_FAIL_JOB=true
+        fi
+
+        # --- CONCLUDE RUN WITH TRUTHFUL EXIT CODE ---
+        if [ "$SHOULD_FAIL_JOB" = true ]; then
           exit 1
         fi

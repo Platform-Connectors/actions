@@ -25,10 +25,14 @@ inputs:
     description: Whether to run Pytest with coverage.
     required: false
     default: "true"
-  diff-coverage-threshold:
-    description: Minimum PR changed-lines coverage percentage enforced by diff-cover.
+  total-coverage-threshold:
+    description: "Minimum overall codebase coverage percentage enforced."
     required: false
     default: "95"
+  diff-coverage-threshold:
+    description: "Minimum PR changed-lines coverage percentage enforced by diff-cover."
+    required: false
+    default: "100"
 
 outputs:
   coverage-report:
@@ -47,6 +51,7 @@ runs:
     - name: Checkout
       uses: actions/checkout@v6.0.2
       with:
+        # needed for diff-cover
         fetch-depth: 0
 
     - name: Setup Python
@@ -58,6 +63,7 @@ runs:
       uses: astral-sh/setup-uv@v8.1.0
       with:
         enable-cache: true
+        cache-dependency-glob: "**/uv.lock"
 
     - name: Install dependencies
       shell: bash
@@ -98,24 +104,94 @@ runs:
         echo "## Coverage Summary" >> "$GITHUB_STEP_SUMMARY"
         echo "Total coverage: ${TOTAL_COVERAGE}%" >> "$GITHUB_STEP_SUMMARY"
 
-    - name: Ensure base branch is available (PR only)
-      if: github.event_name == 'pull_request'
-      shell: bash
-      run: git fetch origin "${{ github.base_ref }}"
-
-    - name: Diff coverage (PR only)
-      if: ${{ github.event_name == 'pull_request' && inputs.run-pytest == 'true' }}
-      id: diff_cover
+    - name: Run Diff Coverage Extraction
+      id: diff_coverage
       shell: bash
       run: |
-        set +e
-        DIFF_OUTPUT=$(uvx --from diff-cover diff-cover coverage.xml \
+        uvx --from diff-cover diff-cover coverage.xml \
           --compare-branch=origin/${{ github.base_ref }} \
           --fail-under=${{ inputs.diff-coverage-threshold }} \
-          --format markdown:diff-cover.md)
-        EXIT_CODE=$?
-        echo "$DIFF_OUTPUT"
-        DIFF_COVERAGE=$(echo "$DIFF_OUTPUT" | sed -nE 's/^Total:[[:space:]]*([0-9]+([.][0-9]+)?)%.*/\1/p' | tail -n1)
+          --format markdown:diff-cover.md \
+          --format json:diff-cover.json
+
+        DIFF_EXIT_CODE=$?
+
+        if [ -f diff-cover.json ]; then
+          HAS_CHANGES=$(python3 -c "import json; data=json.load(open('diff-cover.json')); print('false' if data.get('total_lines', 0) == 0 else 'true')")
+          DIFF_COVERAGE=$(python3 -c "import json; data=json.load(open('diff-cover.json')); print(f'{float(data.get(\"total_percentage\", 0)):.2f}')")
+        else
+          HAS_CHANGES="false"
+          DIFF_COVERAGE="0.00"
+        fi
+
+        echo "has-changes=$HAS_CHANGES" >> "$GITHUB_OUTPUT"
         echo "diff-coverage=$DIFF_COVERAGE" >> "$GITHUB_OUTPUT"
-        cat diff-cover.md >> "$GITHUB_STEP_SUMMARY"
-        exit $EXIT_CODE
+        echo "diff-exit-code=$DIFF_EXIT_CODE" >> "$GITHUB_OUTPUT"
+
+        if [ "$HAS_CHANGES" = "true" ] && [ -f diff-cover.md ]; then
+          cat diff-cover.md >> $GITHUB_STEP_SUMMARY
+        else
+          echo "### ℹ️ Patch Summary" >> $GITHUB_STEP_SUMMARY
+          echo "No source code line modifications detected inside this PR diff." >> $GITHUB_STEP_SUMMARY
+        fi
+    - name: Post Status Check to PR
+      if: success()
+      env:
+        GH_TOKEN: ${{ github.token }}
+        TOTAL_COVERAGE: ${{ steps.coverage.outputs.total-coverage }}
+        TOTAL_TARGET: ${{ inputs.total-coverage-threshold }}
+        HAS_CHANGES: ${{ steps.diff_coverage.outputs.has-changes }}
+        DIFF_COVERAGE: ${{ steps.diff_coverage.outputs.diff-coverage }}
+        DIFF_EXIT_CODE: ${{ steps.diff_coverage.outputs.diff-exit-code }}
+        DIFF_TARGET: ${{ inputs.diff-coverage-threshold }}
+        TARGET_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+      shell: bash
+      run: |
+        SHOULD_FAIL_JOB=false
+
+        # 1. Check Total Codebase Coverage Threshold
+        TOTAL_PASSED=$(python3 -c "print('true' if float('$TOTAL_COVERAGE') >= float('$TOTAL_TARGET') else 'false')")
+
+        if [ "$TOTAL_PASSED" = "false" ]; then
+          TOTAL_DESC="TOTAL coverage fell short: ${TOTAL_COVERAGE}% (Target ${TOTAL_TARGET}%)"
+          echo "❌ $TOTAL_DESC"
+          
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            /repos/${{ github.repository }}/statuses/${{ github.event.pull_request.head.sha }} \
+            -f state="failure" \
+            -f context="coverage/project" \
+            -f description="$TOTAL_DESC" \
+            -f target_url="$TARGET_URL"
+            
+          SHOULD_FAIL_JOB=true
+        fi
+
+        # 2. Check Patch/Diff Coverage Threshold (Only if code actually changed)
+        if [ "$HAS_CHANGES" = "true" ]; then
+          DIFF_PASSED=$(python3 -c "print('true' if float('$DIFF_COVERAGE') >= float('$DIFF_TARGET') else 'false')")
+          
+          if [ "$DIFF_PASSED" = "false" ] || [ "$DIFF_EXIT_CODE" -ne 0 ]; then
+            DIFF_DESC="PATCH coverage fell short: ${DIFF_COVERAGE}% (Target ${DIFF_TARGET}%)"
+            echo "❌ $DIFF_DESC"
+            
+            gh api \
+              --method POST \
+              -H "Accept: application/vnd.github+json" \
+              /repos/${{ github.repository }}/statuses/${{ github.event.pull_request.head.sha }} \
+              -f state="failure" \
+              -f context="coverage/changes" \
+              -f description="$DIFF_DESC" \
+              -f target_url="$TARGET_URL"
+
+            SHOULD_FAIL_JOB=true
+          fi
+        fi
+
+        # 3. Final Termination Handler
+        if [ "$SHOULD_FAIL_JOB" = "true" ]; then
+          exit 1
+        fi
+
+        echo "✅ All coverage matrices passed safely. Passing silently."

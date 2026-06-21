@@ -50,6 +50,9 @@ runs:
   steps:
     - name: Checkout
       uses: actions/checkout@v6.0.2
+      with:
+        # needed for diff-cover
+        fetch-depth: 0
 
     - name: Setup Python
       uses: actions/setup-python@v6.2.0
@@ -100,11 +103,6 @@ runs:
         echo "total-coverage=$TOTAL_COVERAGE" >> "$GITHUB_OUTPUT"
         echo "## Coverage Summary" >> "$GITHUB_STEP_SUMMARY"
         echo "Total coverage: ${TOTAL_COVERAGE}%" >> "$GITHUB_STEP_SUMMARY"
-
-    - name: Ensure base branch is available (PR only)
-      if: github.event_name == 'pull_request'
-      shell: bash
-      run: git fetch origin "${{ github.base_ref }}"
 
     - name: Run Diff Coverage Extraction
       id: diff_coverage

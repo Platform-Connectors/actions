@@ -51,7 +51,8 @@ jobs:
 | `run-mypy` | Whether to run MyPy | No | `true` |
 | `run-pylint` | Whether to run Pylint | No | `true` |
 | `run-pytest` | Whether to run Pytest + coverage | No | `true` |
-| `diff-coverage-threshold` | Minimum changed-lines coverage percent for PRs | No | `95` |
+| `total-coverage-threshold` | Minimum overall codebase coverage percentage enforced | No | `95` |
+| `diff-coverage-threshold` | Minimum changed-lines coverage percentage enforced by diff-cover | No | `100` |
 
 ## Outputs
 

@@ -164,7 +164,7 @@ runs:
             -H "Accept: application/vnd.github+json" \
             /repos/${{ github.repository }}/statuses/${{ github.event.pull_request.head.sha }} \
             -f state="failure" \
-            -f context="diff-cover/project" \
+            -f context="coverage/project" \
             -f description="$TOTAL_DESC" \
             -f target_url="$TARGET_URL"
             
@@ -184,7 +184,7 @@ runs:
               -H "Accept: application/vnd.github+json" \
               /repos/${{ github.repository }}/statuses/${{ github.event.pull_request.head.sha }} \
               -f state="failure" \
-              -f context="diff-cover/patch" \
+              -f context="coverage/changes" \
               -f description="$DIFF_DESC" \
               -f target_url="$TARGET_URL"
 
